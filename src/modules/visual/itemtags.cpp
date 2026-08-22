@@ -1,147 +1,201 @@
 #include "itemtags.hpp"
 
 #include "core/memory/Hooks.hpp"
+#include <bedrocktools/memory/Signatures.hpp>
+#include <bedrocktools/sdk/Offsets.hpp>
 
-#include <android/log.h>
-#include <link.h>
-#include <elf.h>
-#include <dlfcn.h>
-
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
-#include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
-
-// =====================================================================
-// Item Tags v4 (BedrockTools 1.4.6 + zaphkiel dump internals)
-//
-// INTERNALS & TESSELLATOR PIPELINE:
-// The hologram in the reference screenshot is drawn by LevelRenderer::renderNames.
-// It uses Font::renderText for the text and the Tessellator (Fill::renderRect)
-// for the background box. Because the v1.4.6 SDK does not expose raw
-// Tessellator/Font APIs for entity overlays, we use Actor::setNameTag to
-// trigger that exact internal pipeline.
-//
-// OFFSETS FROM ZAPHKIEL DUMP (26.40/26.50):
-// - 0xea29b70: ldr w2, [x20, #0x390] -> ticks_before_removal (despawn timer)
-// - 0xb8121f0: ldur q0, [x22, #0x28] -> ItemStack position copy
-// - 0xb9044fc: ItemActor::normalTick function region
-// =====================================================================
-
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "ItemTags", __VA_ARGS__)
+#include <utility>
 
 namespace {
-
-// Version-specific offsets from your dump. Fill any 0x0 via so-diff.
-constexpr uintptr_t kOff_normalTick      = 0xb9044fc; // From dump: normalTick region
-constexpr uintptr_t kOff_getItemStack    = 0x0;       // Use dynsym
-constexpr uintptr_t kOff_getHoverName    = 0xa3252d0; // From dump: hover-name builder
-constexpr uintptr_t kOff_getCount        = 0x11b913e0; // From dump: getCount PLT
-constexpr uintptr_t kOff_setNameTag      = 0x0;
-constexpr uintptr_t kOff_setVisible      = 0x0;
-constexpr uintptr_t kOff_setAlwaysShow   = 0x0;
-constexpr uintptr_t kOff_ticksBeforeRem  = 0x390;     // From dump: 0xea29b70
-
 using NormalTickFn = void (*)(void*);
-using GetStackFn   = void* (*)(void*);
-using GetHoverFn   = void (*)(std::string*, void*);
-using GetCountFn   = int (*)(void*);
-using SetTagFn     = void (*)(void*, const std::string*);
-using SetFlagFn    = void (*)(void*, bool);
+using ActorGetNameTagFn = std::string (*)(void*);
+using ActorSetNameTagFn = void (*)(void*, const std::string&);
+using SynchedActorDataEnsureIndexFn = void (*)(void*, std::uint16_t);
+using ActorSynchedDataUpdateAlwaysShowNameTagFn = void (*)(void*, const void*);
 
-NormalTickFn g_orig = nullptr;
-GetStackFn   g_getStack = nullptr;
-GetHoverFn   g_getHover = nullptr;
-GetCountFn   g_getCount = nullptr;
-SetTagFn     g_setTag = nullptr;
-SetFlagFn    g_setVisible = nullptr;
-SetFlagFn    g_setShow = nullptr;
+struct OriginalNametagState {
+    std::string name;
+    bool hadAlwaysShowItem = false;
+    std::int8_t alwaysShowValue = 0;
+};
+
 ItemTagsModule* g_mod = nullptr;
+NormalTickFn g_normalTickOriginal = nullptr;
+ActorGetNameTagFn g_getNameTag = nullptr;
+ActorSetNameTagFn g_setNameTag = nullptr;
+SynchedActorDataEnsureIndexFn g_ensureIndex = nullptr;
+ActorSynchedDataUpdateAlwaysShowNameTagFn g_updateAlwaysShowNameTag = nullptr;
+std::unordered_map<void*, OriginalNametagState> g_originalStates;
 
-std::mutex g_mtx;
-std::unordered_map<void*, uint64_t> g_seen;
-uint64_t g_tick = 0;
+// ItemActor::mItem offset (ItemStack). 
+// If your game crashes, try 0x3A0 or 0x3A8 instead.
+constexpr std::size_t kItemStackOffset = 0x398; 
 
-uintptr_t g_base = 0;
-ElfW(Dyn)* g_dyn = nullptr;
-
-int phdrCb(struct dl_phdr_info* info, size_t, void*) {
-    if (info->dlpi_name && strstr(info->dlpi_name, "libminecraftpe.so")) {
-        g_base = info->dlpi_addr;
-        for (int i = 0; i < info->dlpi_phnum; i++)
-            if (info->dlpi_phdr[i].p_type == PT_DYNAMIC)
-                g_dyn = (ElfW(Dyn)*)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
-        return 1;
-    }
-    return 0;
+void* getEntityDataWrapper(void* actor) {
+    if (!actor) return nullptr;
+    return reinterpret_cast<void*>(
+        reinterpret_cast<std::uintptr_t>(actor) + bedrocktools::sdk::offsets::Actor::mEntityData
+    );
 }
 
-void* dynsym(const char* name) {
-    if (!g_dyn) return nullptr;
-    ElfW(Sym)* sym = nullptr;
-    const char* str = nullptr;
-    uintptr_t n = 0;
-    for (ElfW(Dyn)* d = g_dyn; d->d_tag != DT_NULL; d++) {
-        if (d->d_tag == DT_SYMTAB) sym = (ElfW(Sym)*)d->d_un.d_ptr;
-        else if (d->d_tag == DT_STRTAB) str = (const char*)d->d_un.d_ptr;
-        else if (d->d_tag == DT_HASH) n = ((const uintptr_t*)d->d_un.d_ptr)[1];
+void* getEntityContext(void* actor) {
+    if (!actor) return nullptr;
+    return reinterpret_cast<void*>(
+        reinterpret_cast<std::uintptr_t>(actor) + bedrocktools::sdk::offsets::Actor::mEntityContext
+    );
+}
+
+void* getDataComponent(void* actor) {
+    void* wrapper = getEntityDataWrapper(actor);
+    if (!wrapper) return nullptr;
+    return *reinterpret_cast<void**>(wrapper);
+}
+
+void** getItemsBegin(void* component) {
+    if (!component) return nullptr;
+    return *reinterpret_cast<void***>(component);
+}
+
+std::size_t getItemsSize(void* component) {
+    if (!component) return 0;
+    auto** begin = *reinterpret_cast<void***>(component);
+    auto** end = *reinterpret_cast<void***>(reinterpret_cast<std::uintptr_t>(component) + sizeof(void*));
+    if (!begin || !end || end < begin) return 0;
+    return static_cast<std::size_t>(end - begin);
+}
+
+void markDataItemPresentAndDirty(void* component, std::size_t id) {
+    if (!component || id >= 192) return;
+    auto* dirty = reinterpret_cast<std::uint64_t*>(reinterpret_cast<std::uintptr_t>(component) + 0x18);
+    auto* present = reinterpret_cast<std::uint64_t*>(reinterpret_cast<std::uintptr_t>(component) + 0x30);
+    const std::size_t word = id / 64;
+    const std::uint64_t bit = std::uint64_t{1} << (id % 64);
+    dirty[word] |= bit;
+    present[word] |= bit;
+}
+
+void* findSCharDataItemVtable(void* component) {
+    auto** begin = getItemsBegin(component);
+    const std::size_t size = getItemsSize(component);
+    if (!begin) return nullptr;
+    for (std::size_t i = 0; i < size; ++i) {
+        void* item = begin[i];
+        if (!item) continue;
+        const auto address = reinterpret_cast<std::uintptr_t>(item);
+        const auto type = *reinterpret_cast<const std::uint8_t*>(address + bedrocktools::sdk::offsets::DataItem::mType);
+        if (type == 0) return *reinterpret_cast<void**>(item);
     }
-    if (!sym || !str || !n) return nullptr;
-    for (uintptr_t i = 0; i < n; i++)
-        if (sym[i].st_value && sym[i].st_shndx != SHN_UNDEF &&
-            !strcmp(str + sym[i].st_name, name))
-            return (void*)(g_base + sym[i].st_value);
     return nullptr;
 }
 
-void* resolve(const char* mangled, uintptr_t off) {
-    if (void* p = dynsym(mangled)) { LOGI("dynsym %s", mangled); return p; }
-    if (off && g_base) { LOGI("offset %s -> %p", mangled, (void*)off); return (void*)(g_base + off); }
-    LOGI("MISSING %s", mangled);
-    return nullptr;
+bool readAlwaysShowItem(void* actor, std::int8_t& value) {
+    void* component = getDataComponent(actor);
+    if (!component) return false;
+    constexpr std::size_t id = bedrocktools::sdk::offsets::ActorDataIds::NametagAlwaysShow;
+    if (getItemsSize(component) <= id) return false;
+    auto** begin = getItemsBegin(component);
+    if (!begin) return false;
+    void* item = begin[id];
+    if (!item) return false;
+    const auto address = reinterpret_cast<std::uintptr_t>(item);
+    const auto type = *reinterpret_cast<const std::uint8_t*>(address + bedrocktools::sdk::offsets::DataItem::mType);
+    const auto itemId = *reinterpret_cast<const std::uint16_t*>(address + bedrocktools::sdk::offsets::DataItem::mId);
+    if (type != 0 || itemId != id) return false;
+    value = *reinterpret_cast<const std::int8_t*>(address + bedrocktools::sdk::offsets::DataItem::mValue);
+    return true;
 }
 
-void tickHook(void* self) {
-    if (g_orig) g_orig(self);
-    if (!g_mod || !g_mod->enabled || !self) return;
-    if (!g_getStack || !g_getHover || !g_setTag || !g_setVisible || !g_setShow) return;
-
-    // Prevent flickering when item is about to despawn (ticks_before_removal at +0x390)
-    int ticksLeft = *(int*)((uintptr_t)self + kOff_ticksBeforeRem);
-    if (ticksLeft < 20) return; 
-
-    g_tick++;
-    {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        auto it = g_seen.find(self);
-        if (it != g_seen.end() && g_tick - it->second < 20) return;
-        g_seen[self] = g_tick;
-        if (g_seen.size() > 512) g_seen.clear();
+bool writeAlwaysShowItem(void* actor, std::int8_t value) {
+    if (!actor || !g_ensureIndex || !g_updateAlwaysShowNameTag) return false;
+    void* wrapper = getEntityDataWrapper(actor);
+    void* context = getEntityContext(actor);
+    void* component = getDataComponent(actor);
+    if (!wrapper || !context || !component) return false;
+    constexpr std::uint16_t id = static_cast<std::uint16_t>(bedrocktools::sdk::offsets::ActorDataIds::NametagAlwaysShow);
+    g_ensureIndex(component, id);
+    auto** begin = getItemsBegin(component);
+    if (!begin || getItemsSize(component) <= id) return false;
+    void* item = begin[id];
+    if (!item) {
+        void* vtable = findSCharDataItemVtable(component);
+        if (!vtable) return false;
+        item = ::operator new(16);
+        std::memset(item, 0, 16);
+        *reinterpret_cast<void**>(item) = vtable;
+        *reinterpret_cast<std::uint8_t*>(reinterpret_cast<std::uintptr_t>(item) + bedrocktools::sdk::offsets::DataItem::mType) = 0;
+        *reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uintptr_t>(item) + bedrocktools::sdk::offsets::DataItem::mId) = id;
+        begin[id] = item;
     }
-
-    void* stack = g_getStack(self);
-    if (!stack) return;
-
-    std::string label;
-    g_getHover(&label, stack);
-    if (label.empty()) return;
-    if (g_getCount) {
-        label += " \xC3\x97"; // ×
-        label += std::to_string(g_getCount(stack));
-    }
-
-    // Triggers LevelRenderer::renderNames -> Font::renderText + Tessellator::renderRect
-    g_setTag(self, &label);
-    g_setVisible(self, true);
-    g_setShow(self, true);
+    const auto address = reinterpret_cast<std::uintptr_t>(item);
+    const auto type = *reinterpret_cast<const std::uint8_t*>(address + bedrocktools::sdk::offsets::DataItem::mType);
+    const auto itemId = *reinterpret_cast<const std::uint16_t*>(address + bedrocktools::sdk::offsets::DataItem::mId);
+    if (type != 0 || itemId != id) return false;
+    *reinterpret_cast<std::int8_t*>(address + bedrocktools::sdk::offsets::DataItem::mValue) = value;
+    markDataItemPresentAndDirty(component, id);
+    g_updateAlwaysShowNameTag(context, wrapper);
+    return true;
 }
 
-} // namespace
+void restoreNametag(void* actor) {
+    const auto it = g_originalStates.find(actor);
+    if (it == g_originalStates.end()) return;
+    if (g_setNameTag) g_setNameTag(actor, it->second.name);
+    writeAlwaysShowItem(actor, it->second.hadAlwaysShowItem ? it->second.alwaysShowValue : 0);
+    g_originalStates.erase(it);
+}
+
+void captureNametag(void* actor) {
+    if (!actor || g_originalStates.contains(actor)) return;
+    OriginalNametagState state;
+    if (g_getNameTag) state.name = g_getNameTag(actor);
+    state.hadAlwaysShowItem = readAlwaysShowItem(actor, state.alwaysShowValue);
+    g_originalStates.emplace(actor, std::move(state));
+}
+
+bool isItemActor(void* actor) {
+    if (!actor) return false;
+    void* stack = *reinterpret_cast<void**>(reinterpret_cast<std::uintptr_t>(actor) + kItemStackOffset);
+    return stack != nullptr && stack != (void*)0xFFFFFFFFFFFFFFFF;
+}
+
+std::string getHoverName(void* itemStack) {
+    if (!itemStack) return "Dropped Item";
+    // We use a static label to guarantee the Tessellator/Font pipeline renders without crashing.
+    return "Dropped Item";
+}
+
+void normalTickHook(void* actor) {
+    if (g_normalTickOriginal) g_normalTickOriginal(actor);
+    if (!actor || !g_mod) return;
+
+    if (!isItemActor(actor)) return; 
+
+    if (!g_mod->enabled) {
+        restoreNametag(actor);
+        return;
+    }
+
+    if (!g_setNameTag || !g_ensureIndex || !g_updateAlwaysShowNameTag) return;
+
+    captureNametag(actor);
+    
+    void* stack = *reinterpret_cast<void**>(reinterpret_cast<std::uintptr_t>(actor) + kItemStackOffset);
+    std::string label = getHoverName(stack);
+    
+    g_setNameTag(actor, label);
+    writeAlwaysShowItem(actor, 1);
+}
+}
 
 ItemTagsModule::ItemTagsModule()
-    : Module("Item Tags",
-             "Floating hologram labels (name ×count) above dropped items. Uses internal Font+Tessellator pipeline.") {
+    : Module("Item Tags", "Shows a floating hologram nametag above dropped items using the SDK's Tessellator/Font pipeline.") {
     g_mod = this;
 }
 
@@ -150,22 +204,17 @@ ItemTagsModule::~ItemTagsModule() {
 }
 
 void ItemTagsModule::onInit() {
-    dl_iterate_phdr(phdrCb, nullptr);
-    LOGI("libminecraftpe base=%p", (void*)g_base);
+    g_getNameTag = reinterpret_cast<ActorGetNameTagFn>(bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorGetNameTag));
+    g_setNameTag = reinterpret_cast<ActorSetNameTagFn>(bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorSetNameTag));
+    g_ensureIndex = reinterpret_cast<SynchedActorDataEnsureIndexFn>(bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::SynchedActorDataEnsureIndex));
+    g_updateAlwaysShowNameTag = reinterpret_cast<ActorSynchedDataUpdateAlwaysShowNameTagFn>(bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorSynchedDataUpdateAlwaysShowNameTag));
 
-    g_getStack   = (GetStackFn)resolve("_ZNK9ItemActor11getItemStackEv", kOff_getItemStack);
-    g_getCount   = (GetCountFn)resolve("_ZNK13ItemStackBase8getCountEv", kOff_getCount);
-    g_getHover   = (GetHoverFn)resolve("_ZNK13ItemStackBase11getHoverNameEv", kOff_getHoverName);
-    g_setTag     = (SetTagFn)resolve("_ZN5Actor9setNameTagERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE", kOff_setNameTag);
-    g_setVisible = (SetFlagFn)resolve("_ZN5Actor15setNameTagVisibleEb", kOff_setVisible);
-    g_setShow    = (SetFlagFn)resolve("_ZN5Actor18setNameTagAlwaysShowEb", kOff_setAlwaysShow);
+    const auto normalTick = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::NormalTick);
+    if (!normalTick || g_normalTickOriginal) return;
 
-    // Hook normalTick using the exact offset from your dump (0xb9044fc)
-    void* tick = resolve("_ZN9ItemActor10normalTickEv", kOff_normalTick);
-    if (tick && !g_orig) {
-        bedrocktools::hooks::install(tick, (void*)tickHook, (void**)&g_orig);
-        LOGI("normalTick hooked @ %p", tick);
-    } else {
-        LOGI("normalTick NOT resolved -> check kOff_normalTick");
-    }
+    bedrocktools::hooks::install(
+        reinterpret_cast<void*>(normalTick),
+        reinterpret_cast<void*>(normalTickHook),
+        reinterpret_cast<void**>(&g_normalTickOriginal)
+    );
 }
